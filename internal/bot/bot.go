@@ -31,6 +31,10 @@ func NewBot(cfg *config.Config) (*Bot, error) {
 		"机器人ID": bot.Self.ID,
 	}).Info("🔐 机器人授权成功")
 
+	// 输出隐私模式提示
+	logrus.Warn("⚠️  如果机器人在公开群组中无法接收命令，请检查隐私模式设置")
+	logrus.Warn("📝 使用 @BotFather 发送 /setprivacy 并选择 Disable")
+
 	// 创建服务
 	banService := service.NewBanService()
 	muteService := service.NewMuteService()
@@ -72,8 +76,8 @@ func (b *Bot) Start() error {
 	}
 	logrus.WithField("检查间隔", b.cfg.Scheduler.CheckExpireInterval).Info("✅ 定时任务已启动")
 
-	// 配置更新
-	u := tgbotapi.NewUpdate(0)
+	// 配置更新 - 使用 -1 来只获取新消息，忽略历史消息
+	u := tgbotapi.NewUpdate(-1)
 	u.Timeout = 60
 
 	updates := b.api.GetUpdatesChan(u)
@@ -99,10 +103,16 @@ func (b *Bot) Stop() {
 func (b *Bot) handleUpdate(update tgbotapi.Update) {
 	// 处理消息
 	if update.Message != nil {
-		// 检查是否为未授权群组
-		if update.Message.Chat.IsGroup() || update.Message.Chat.IsSuperGroup() {
-			b.handler.CheckUnauthorizedGroup(update.Message)
-		}
+		// 调试日志：记录所有消息
+		logrus.WithFields(logrus.Fields{
+			"消息ID":  update.Message.MessageID,
+			"消息文本":  update.Message.Text,
+			"是否为命令": update.Message.IsCommand(),
+			"聊天类型":  update.Message.Chat.Type,
+			"聊天ID":  update.Message.Chat.ID,
+			"聊天标题":  update.Message.Chat.Title,
+			"聊天用户名": update.Message.Chat.UserName,
+		}).Debug("🔍 收到消息")
 
 		// 检查新成员
 		if update.Message.NewChatMembers != nil && len(update.Message.NewChatMembers) > 0 {
@@ -116,6 +126,11 @@ func (b *Bot) handleUpdate(update tgbotapi.Update) {
 		} else {
 			// 处理文本消息（对话模式）
 			b.handler.HandleTextMessage(update.Message)
+		}
+
+		// 检查是否为未授权群组（在处理完命令后再检查，避免阻止命令执行）
+		if update.Message.Chat.IsGroup() || update.Message.Chat.IsSuperGroup() {
+			b.handler.CheckUnauthorizedGroup(update.Message)
 		}
 	}
 

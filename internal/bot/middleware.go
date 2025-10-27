@@ -144,4 +144,3 @@ func CheckUserMuted(userID int64, muteService *service.MuteService) bool {
 	}
 	return muted
 }
-

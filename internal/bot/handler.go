@@ -13,16 +13,17 @@ import (
 
 // Handler Bot命令处理器
 type Handler struct {
-	bot                 *tgbotapi.BotAPI
-	cfg                 *config.Config
-	permissionChecker   *PermissionChecker
-	banService          *service.BanService
-	muteService         *service.MuteService
-	groupService        *service.GroupService
-	adminService        *service.AdminService
-	logService          *service.LogService
-	notificationService *service.NotificationService
-	rateLimiter         *utils.RateLimiter
+	bot                  *tgbotapi.BotAPI
+	cfg                  *config.Config
+	permissionChecker    *PermissionChecker
+	banService           *service.BanService
+	muteService          *service.MuteService
+	groupService         *service.GroupService
+	adminService         *service.AdminService
+	logService           *service.LogService
+	notificationService  *service.NotificationService
+	rateLimiter          *utils.RateLimiter
+	notifiedUnauthorized map[int64]bool // 记录已通知的未授权群组
 }
 
 // NewHandler 创建处理器
@@ -36,16 +37,17 @@ func NewHandler(bot *tgbotapi.BotAPI, cfg *config.Config,
 	notificationService *service.NotificationService) *Handler {
 
 	return &Handler{
-		bot:                 bot,
-		cfg:                 cfg,
-		permissionChecker:   permissionChecker,
-		banService:          banService,
-		muteService:         muteService,
-		groupService:        groupService,
-		adminService:        adminService,
-		logService:          logService,
-		notificationService: notificationService,
-		rateLimiter:         utils.NewRateLimiter(cfg.System.RateLimitPerGroup),
+		bot:                  bot,
+		cfg:                  cfg,
+		permissionChecker:    permissionChecker,
+		banService:           banService,
+		muteService:          muteService,
+		groupService:         groupService,
+		adminService:         adminService,
+		logService:           logService,
+		notificationService:  notificationService,
+		rateLimiter:          utils.NewRateLimiter(cfg.System.RateLimitPerGroup),
+		notifiedUnauthorized: make(map[int64]bool),
 	}
 }
 
@@ -66,6 +68,14 @@ func (h *Handler) HandleMessage(message *tgbotapi.Message) {
 	}
 
 	command := message.Command()
+
+	// 调试：记录原始命令和处理后的命令
+	logrus.WithFields(logrus.Fields{
+		"原始文本":  message.Text,
+		"提取的命令": command,
+		"是否为命令": message.IsCommand(),
+		"命令参数":  message.CommandArguments(),
+	}).Debug("🔍 命令解析")
 
 	// 获取用户和群组信息
 	userName := message.From.FirstName
@@ -139,11 +149,22 @@ func (h *Handler) handleHelp(message *tgbotapi.Message) {
 // handleKick 处理踢出命令
 func (h *Handler) handleKick(message *tgbotapi.Message) {
 	// 检查权限
-	hasPermission, _ := h.permissionChecker.CheckPermission(message)
+	hasPermission, reason := h.permissionChecker.CheckPermission(message)
 	if !hasPermission {
+		logrus.WithFields(logrus.Fields{
+			"用户ID": message.From.ID,
+			"群组ID": message.Chat.ID,
+			"原因":   reason,
+		}).Warn("⛔ 权限检查失败")
 		h.sendReply(message.Chat.ID, message.MessageID, "❌ 您没有权限执行此操作")
 		return
 	}
+
+	logrus.WithFields(logrus.Fields{
+		"用户ID": message.From.ID,
+		"群组ID": message.Chat.ID,
+		"权限类型": reason,
+	}).Debug("✅ 权限检查通过")
 
 	// 解析命令
 	params, err := ParseCommand(message, h.bot)
@@ -234,11 +255,22 @@ func (h *Handler) handleKick(message *tgbotapi.Message) {
 // handleBan 处理拉黑命令
 func (h *Handler) handleBan(message *tgbotapi.Message) {
 	// 检查权限
-	hasPermission, _ := h.permissionChecker.CheckPermission(message)
+	hasPermission, reason := h.permissionChecker.CheckPermission(message)
 	if !hasPermission {
+		logrus.WithFields(logrus.Fields{
+			"用户ID": message.From.ID,
+			"群组ID": message.Chat.ID,
+			"原因":   reason,
+		}).Warn("⛔ 权限检查失败")
 		h.sendReply(message.Chat.ID, message.MessageID, "❌ 您没有权限执行此操作")
 		return
 	}
+
+	logrus.WithFields(logrus.Fields{
+		"用户ID": message.From.ID,
+		"群组ID": message.Chat.ID,
+		"权限类型": reason,
+	}).Debug("✅ 权限检查通过")
 
 	// 解析命令
 	params, err := ParseCommand(message, h.bot)
@@ -446,11 +478,22 @@ func (h *Handler) handleUnban(message *tgbotapi.Message) {
 // handleMute 处理禁言命令
 func (h *Handler) handleMute(message *tgbotapi.Message) {
 	// 检查权限
-	hasPermission, _ := h.permissionChecker.CheckPermission(message)
+	hasPermission, reason := h.permissionChecker.CheckPermission(message)
 	if !hasPermission {
+		logrus.WithFields(logrus.Fields{
+			"用户ID": message.From.ID,
+			"群组ID": message.Chat.ID,
+			"原因":   reason,
+		}).Warn("⛔ 权限检查失败")
 		h.sendReply(message.Chat.ID, message.MessageID, "❌ 您没有权限执行此操作")
 		return
 	}
+
+	logrus.WithFields(logrus.Fields{
+		"用户ID": message.From.ID,
+		"群组ID": message.Chat.ID,
+		"权限类型": reason,
+	}).Debug("✅ 权限检查通过")
 
 	// 解析命令
 	params, err := ParseCommand(message, h.bot)
@@ -771,9 +814,29 @@ func (h *Handler) CheckUnauthorizedGroup(message *tgbotapi.Message) {
 	// 检查群组是否已授权
 	isAuthorized := h.permissionChecker.IsGroupAuthorized(message.Chat.ID)
 	if !isAuthorized {
-		// 发送通知
+		// 检查是否已经通知过这个群组
+		if h.notifiedUnauthorized[message.Chat.ID] {
+			return // 已经通知过，不重复通知
+		}
+
+		// 标记为已通知
+		h.notifiedUnauthorized[message.Chat.ID] = true
+
+		// 发送通知 - 使用普通文本避免转义问题
 		groupName := GetChatTitle(message.Chat)
-		text := fmt.Sprintf("⚠️ 检测到未授权群组\n\n群组：%s\nID：`%d`\n\n机器人将退出该群组", groupName, message.Chat.ID)
+		groupUsername := GetChatUsername(message.Chat)
+
+		var text string
+		if groupUsername != "" {
+			// 公开群组，显示为超链接
+			text = fmt.Sprintf("⚠️ *检测到未授权群组*\n\n*群组*：[%s](https://t.me/%s)\n*ID*：`%d`\n\n机器人将退出该群组",
+				utils.EscapeMarkdown(groupName), groupUsername, message.Chat.ID)
+		} else {
+			// 私密群组
+			text = fmt.Sprintf("⚠️ *检测到未授权群组*\n\n*群组*：%s\n*ID*：`%d`\n\n机器人将退出该群组",
+				utils.EscapeMarkdown(groupName), message.Chat.ID)
+		}
+
 		h.notificationService.SendTextMessage(h.cfg.Telegram.AuthorID, text)
 
 		// 退出群组
@@ -783,11 +846,14 @@ func (h *Handler) CheckUnauthorizedGroup(message *tgbotapi.Message) {
 		_, err := h.bot.Request(leaveConfig)
 		if err != nil {
 			logrus.Errorf("Failed to leave unauthorized group: %v", err)
+		} else {
+			// 退出成功后，从已通知列表中移除（因为已经退出了）
+			delete(h.notifiedUnauthorized, message.Chat.ID)
 		}
 
 		logrus.WithFields(logrus.Fields{
 			"群组名称": groupName,
 			"群组ID": message.Chat.ID,
-		}).Info("⚠️  检测到未授权群组，已自动退出")
+		}).Info("⚠️ 检测到未授权群组，已自动退出")
 	}
 }

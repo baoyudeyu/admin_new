@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"admin-bot/internal/utils"
 	"fmt"
 	"strconv"
 	"strings"
@@ -65,6 +66,10 @@ func (h *Handler) HandleCallback(callback *tgbotapi.CallbackQuery) {
 		h.handleDisableAdminsCallback(callback)
 	case "enable_admins":
 		h.handleEnableAdminsCallback(callback)
+	case "back":
+		// 返回主菜单
+		h.notificationService.AnswerCallbackQuery(callback.ID, "", false)
+		h.showConfigMenu(callback.Message.Chat.ID)
 	case "close":
 		h.handleCloseCallback(callback)
 	default:
@@ -73,6 +78,8 @@ func (h *Handler) HandleCallback(callback *tgbotapi.CallbackQuery) {
 			h.handleConfirmDelGroup(callback, action)
 		} else if strings.HasPrefix(action, "confirm_del_admin_") {
 			h.handleConfirmDelAdmin(callback, action)
+		} else {
+			h.notificationService.AnswerCallbackQuery(callback.ID, "❌ 无效的操作", true)
 		}
 	}
 }
@@ -246,7 +253,15 @@ func (h *Handler) handleListGroupsCallback(callback *tgbotapi.CallbackQuery) {
 			if groupName == "" {
 				groupName = "未知群组"
 			}
-			text.WriteString(fmt.Sprintf("%d\\. %s\n   ID: `%d`\n\n", i+1, groupName, group.GroupID))
+
+			// 检查是否有用户名（公开群组）
+			if group.Username != "" {
+				text.WriteString(fmt.Sprintf("%d\\. %s @%s\n   ID: `%d`\n\n",
+					i+1, utils.EscapeMarkdown(groupName), group.Username, group.GroupID))
+			} else {
+				text.WriteString(fmt.Sprintf("%d\\. %s\n   ID: `%d`\n\n",
+					i+1, utils.EscapeMarkdown(groupName), group.GroupID))
+			}
 		}
 	}
 
@@ -283,7 +298,7 @@ func (h *Handler) handleListAdminsCallback(callback *tgbotapi.CallbackQuery) {
 			if adminName == "" {
 				adminName = fmt.Sprintf("用户 %d", admin.UserID)
 			}
-			text.WriteString(fmt.Sprintf("%d\\. %s\n   ID: `%d`\n\n", i+1, adminName, admin.UserID))
+			text.WriteString(fmt.Sprintf("%d\\. %s\n   ID: `%d`\n\n", i+1, utils.EscapeMarkdown(adminName), admin.UserID))
 		}
 	}
 
