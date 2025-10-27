@@ -1,0 +1,131 @@
+package bot
+
+import (
+	"admin-bot/internal/config"
+	"admin-bot/internal/scheduler"
+	"admin-bot/internal/service"
+
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/sirupsen/logrus"
+)
+
+// Bot Telegram机器人
+type Bot struct {
+	api       *tgbotapi.BotAPI
+	cfg       *config.Config
+	handler   *Handler
+	scheduler *scheduler.Scheduler
+}
+
+// NewBot 创建机器人实例
+func NewBot(cfg *config.Config) (*Bot, error) {
+	// 创建Bot API
+	bot, err := tgbotapi.NewBotAPI(cfg.Telegram.BotToken)
+	if err != nil {
+		return nil, err
+	}
+
+	bot.Debug = false
+	logrus.WithFields(logrus.Fields{
+		"用户名":   bot.Self.UserName,
+		"机器人ID": bot.Self.ID,
+	}).Info("🔐 机器人授权成功")
+
+	// 创建服务
+	banService := service.NewBanService()
+	muteService := service.NewMuteService()
+	groupService := service.NewGroupService()
+	adminService := service.NewAdminService()
+	logService := service.NewLogService()
+	notificationService := service.NewNotificationService(bot,
+		cfg.Telegram.NotificationChannelID,
+		cfg.Telegram.AuthorID)
+
+	// 创建权限检查器
+	permissionChecker := NewPermissionChecker(cfg, adminService, groupService, bot)
+
+	// 创建处理器
+	handler := NewHandler(bot, cfg, permissionChecker,
+		banService, muteService, groupService, adminService,
+		logService, notificationService)
+
+	// 创建调度器
+	taskScheduler := scheduler.NewScheduler(banService, muteService,
+		groupService, notificationService, bot,
+		cfg.System.RateLimitPerGroup)
+
+	return &Bot{
+		api:       bot,
+		cfg:       cfg,
+		handler:   handler,
+		scheduler: taskScheduler,
+	}, nil
+}
+
+// Start 启动机器人
+func (b *Bot) Start() error {
+	// 启动调度器
+	logrus.Info("⏰ 正在启动定时任务...")
+	err := b.scheduler.Start(b.cfg.Scheduler.CheckExpireInterval)
+	if err != nil {
+		return err
+	}
+	logrus.WithField("检查间隔", b.cfg.Scheduler.CheckExpireInterval).Info("✅ 定时任务已启动")
+
+	// 配置更新
+	u := tgbotapi.NewUpdate(0)
+	u.Timeout = 60
+
+	updates := b.api.GetUpdatesChan(u)
+
+	logrus.Info("📡 开始监听 Telegram 更新...")
+
+	// 处理更新
+	for update := range updates {
+		go b.handleUpdate(update)
+	}
+
+	return nil
+}
+
+// Stop 停止机器人
+func (b *Bot) Stop() {
+	b.scheduler.Stop()
+	b.api.StopReceivingUpdates()
+	logrus.Info("🛑 机器人已停止")
+}
+
+// handleUpdate 处理更新
+func (b *Bot) handleUpdate(update tgbotapi.Update) {
+	// 处理消息
+	if update.Message != nil {
+		// 检查是否为未授权群组
+		if update.Message.Chat.IsGroup() || update.Message.Chat.IsSuperGroup() {
+			b.handler.CheckUnauthorizedGroup(update.Message)
+		}
+
+		// 检查新成员
+		if update.Message.NewChatMembers != nil && len(update.Message.NewChatMembers) > 0 {
+			b.handler.CheckNewMember(update.Message)
+			return
+		}
+
+		// 处理命令
+		if update.Message.IsCommand() {
+			b.handler.HandleMessage(update.Message)
+		} else {
+			// 处理文本消息（对话模式）
+			b.handler.HandleTextMessage(update.Message)
+		}
+	}
+
+	// 处理回调查询
+	if update.CallbackQuery != nil {
+		b.handler.HandleCallback(update.CallbackQuery)
+	}
+}
+
+// GetAPI 获取Bot API
+func (b *Bot) GetAPI() *tgbotapi.BotAPI {
+	return b.api
+}

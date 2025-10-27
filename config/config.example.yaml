@@ -1,0 +1,29 @@
+# Telegram Bot Configuration
+telegram:
+  bot_token: "YOUR_BOT_TOKEN_HERE"
+  author_id: 7556123117
+  notification_channel_id: -1002474636059
+
+# Database Configuration
+database:
+  host: "gz-cynosdbmysql-grp-jj6na063.sql.tencentcdb.com"
+  port: 21151
+  username: "admin_new"
+  password: "04By0340"
+  database: "admin_new"
+  charset: "utf8mb4"
+  max_idle_conns: 10
+  max_open_conns: 100
+  conn_max_lifetime: 3600 # seconds
+
+# System Configuration
+system:
+  rate_limit_per_group: 5 # max operations per second per group
+  admin_enabled: true # enable group admin permissions
+  log_level: "info" # debug, info, warn, error
+  timezone: "Asia/Shanghai"
+
+# Scheduler Configuration
+scheduler:
+  check_expire_interval: "*/1 * * * *" # every minute
+
