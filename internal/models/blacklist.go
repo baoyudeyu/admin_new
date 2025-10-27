@@ -47,4 +47,3 @@ func (b *Blacklist) IsExpired() bool {
 	}
 	return time.Now().After(*b.ExpireAt)
 }
-

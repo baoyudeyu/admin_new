@@ -70,6 +70,7 @@ func (h *Handler) HandleCallback(callback *tgbotapi.CallbackQuery) {
 		// 返回主菜单
 		h.notificationService.AnswerCallbackQuery(callback.ID, "", false)
 		h.showConfigMenu(callback.Message.Chat.ID)
+
 	case "close":
 		h.handleCloseCallback(callback)
 	default:

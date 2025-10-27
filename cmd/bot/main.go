@@ -30,7 +30,7 @@ func main() {
 	}
 	logrus.Info("✅ 配置文件加载成功")
 
-	// 初始化数据库
+	// 初始化数据库连接
 	logrus.Info("🗄️  正在连接数据库...")
 	dbConfig := database.Config{
 		Host:            cfg.Database.Host,
@@ -44,23 +44,21 @@ func main() {
 		ConnMaxLifetime: cfg.Database.ConnMaxLifetime,
 	}
 
-	err = database.InitDB(dbConfig)
-	if err != nil {
+	if err := database.InitDB(dbConfig); err != nil {
 		logrus.Fatalf("❌ 数据库连接失败: %v", err)
 	}
 	logrus.WithFields(logrus.Fields{
-		"主机地址": cfg.Database.Host,
-		"端口":   cfg.Database.Port,
-		"数据库":  cfg.Database.Database,
+		"主机": cfg.Database.Host,
+		"端口": cfg.Database.Port,
+		"库名": cfg.Database.Database,
 	}).Info("✅ 数据库连接成功")
 
-	// 自动迁移数据库表
-	logrus.Info("🔄 正在执行数据库迁移...")
-	err = database.AutoMigrate()
-	if err != nil {
-		logrus.Fatalf("❌ 数据库迁移失败: %v", err)
+	// 自动迁移数据库表结构
+	logrus.Info("🔄 正在同步数据库表结构...")
+	if err := database.AutoMigrate(); err != nil {
+		logrus.Fatalf("❌ 表结构同步失败: %v", err)
 	}
-	logrus.Info("✅ 数据库迁移完成")
+	logrus.Info("✅ 表结构同步完成")
 
 	// 创建机器人
 	logrus.Info("🤖 正在初始化 Telegram 机器人...")

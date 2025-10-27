@@ -47,4 +47,3 @@ func (m *MuteList) IsExpired() bool {
 	}
 	return time.Now().After(*m.ExpireAt)
 }
-

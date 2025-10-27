@@ -18,4 +18,3 @@ type GlobalAdmin struct {
 func (GlobalAdmin) TableName() string {
 	return "global_admins"
 }
-

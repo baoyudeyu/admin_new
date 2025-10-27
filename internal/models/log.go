@@ -15,7 +15,7 @@ type OperationLog struct {
 	OperatorID     int64     `gorm:"not null" json:"operator_id"`
 	OperatorName   string    `gorm:"type:varchar(255)" json:"operator_name"`
 	Reason         string    `gorm:"type:text" json:"reason"`
-	Duration       *int      `json:"duration"` // 秒数
+	Duration       *int      `json:"duration"`                 // 秒数
 	Success        int8      `gorm:"default:1" json:"success"` // 1=成功，0=失败
 	ErrorMsg       string    `gorm:"type:text" json:"error_msg"`
 	CreatedAt      time.Time `gorm:"autoCreateTime;index" json:"created_at"`
@@ -34,4 +34,3 @@ const (
 	OpTypeUnmute = "unmute"
 	OpTypeKick   = "kick"
 )
-
