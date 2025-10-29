@@ -255,15 +255,33 @@ func (h *Handler) handleListGroupsCallback(callback *tgbotapi.CallbackQuery) {
 				groupName = "未知群组"
 			}
 
+			// 检查群组名是否为"群组 ID"格式（说明未获取到真实名称）
+			isPlaceholder := strings.HasPrefix(groupName, "群组 ") || groupName == "未知群组"
+
 			// 检查是否有用户名（公开群组）
 			if group.Username != "" {
-				text.WriteString(fmt.Sprintf("%d\\. %s @%s\n   ID: `%d`\n\n",
-					i+1, utils.EscapeMarkdown(groupName), group.Username, group.GroupID))
+				// 公开群组，显示用户名
+				if isPlaceholder {
+					text.WriteString(fmt.Sprintf("%d\\. @%s\n   ID: `%d`\n   ⚠️ _待更新群组名称_\n\n",
+						i+1, group.Username, group.GroupID))
+				} else {
+					text.WriteString(fmt.Sprintf("%d\\. %s @%s\n   ID: `%d`\n\n",
+						i+1, utils.EscapeMarkdown(groupName), group.Username, group.GroupID))
+				}
 			} else {
-				text.WriteString(fmt.Sprintf("%d\\. %s\n   ID: `%d`\n\n",
-					i+1, utils.EscapeMarkdown(groupName), group.GroupID))
+				// 私密群组或未获取信息
+				if isPlaceholder {
+					text.WriteString(fmt.Sprintf("%d\\. 群组 ID: `%d`\n   ⚠️ _机器人未在群中，待更新信息_\n\n",
+						i+1, group.GroupID))
+				} else {
+					text.WriteString(fmt.Sprintf("%d\\. %s\n   ID: `%d`\n   🔒 _私密群组_\n\n",
+						i+1, utils.EscapeMarkdown(groupName), group.GroupID))
+				}
 			}
 		}
+
+		// 添加说明
+		text.WriteString("💡 _提示：邀请机器人进入群组后会自动更新群组信息_")
 	}
 
 	keyboard := tgbotapi.NewInlineKeyboardMarkup(
@@ -344,9 +362,19 @@ func (h *Handler) handleCloseCallback(callback *tgbotapi.CallbackQuery) {
 
 // HandleTextMessage 处理文本消息（用于对话模式）
 func (h *Handler) HandleTextMessage(message *tgbotapi.Message) {
+	// 只在私聊中处理对话状态，避免群组消息干扰
+	if !message.Chat.IsPrivate() {
+		return
+	}
+
 	// 检查用户是否有待处理的状态
 	state := getUserState(message.From.ID)
 	if state == nil {
+		return
+	}
+
+	// 只允许作者在私聊中进行对话操作
+	if message.From.ID != h.cfg.Telegram.AuthorID {
 		return
 	}
 
@@ -360,8 +388,14 @@ func (h *Handler) HandleTextMessage(message *tgbotapi.Message) {
 	}
 }
 
-// handleWaitingGroupID 处理等待群组ID输入
+// handleWaitingGroupID 处理等待群组ID输入（仅私聊）
 func (h *Handler) handleWaitingGroupID(message *tgbotapi.Message) {
+	// 确保在私聊中
+	if !message.Chat.IsPrivate() {
+		logrus.Warn("尝试在非私聊中处理群组ID输入，已忽略")
+		return
+	}
+
 	// 解析群组ID
 	groupID, err := strconv.ParseInt(strings.TrimSpace(message.Text), 10, 64)
 	if err != nil {
@@ -376,15 +410,32 @@ func (h *Handler) handleWaitingGroupID(message *tgbotapi.Message) {
 		},
 	})
 
-	var groupName string
+	var groupName, groupUsername string
+	var canGetInfo bool
+
 	if err != nil {
+		// 机器人不在群中，无法获取信息
 		groupName = fmt.Sprintf("群组 %d", groupID)
+		groupUsername = ""
+		canGetInfo = false
+		logrus.WithFields(logrus.Fields{
+			"群组ID": groupID,
+			"错误":   err.Error(),
+		}).Warn("⚠️ 无法获取群组信息（机器人可能不在群中）")
 	} else {
+		// 成功获取群组信息
 		groupName = chat.Title
+		groupUsername = chat.UserName
+		canGetInfo = true
+		logrus.WithFields(logrus.Fields{
+			"群组ID": groupID,
+			"群组名":  groupName,
+			"用户名":  groupUsername,
+		}).Info("✅ 成功获取群组信息")
 	}
 
 	// 添加到数据库
-	err = h.groupService.AddAuthorizedGroup(groupID, groupName)
+	err = h.groupService.AddAuthorizedGroupWithUsername(groupID, groupName, groupUsername)
 	if err != nil {
 		logrus.Errorf("Failed to add authorized group: %v", err)
 		h.sendReply(message.Chat.ID, message.MessageID, "❌ 添加失败，可能该群组已存在")
@@ -394,11 +445,32 @@ func (h *Handler) handleWaitingGroupID(message *tgbotapi.Message) {
 	// 清除用户状态
 	clearUserState(message.From.ID)
 
-	h.sendReply(message.Chat.ID, message.MessageID, fmt.Sprintf("✅ 已添加授权群组\n\n群组：%s\nID：`%d`", groupName, groupID))
+	// 根据是否获取到信息给出不同提示
+	var responseText string
+	if canGetInfo {
+		if groupUsername != "" {
+			responseText = fmt.Sprintf("✅ 已添加授权群组\n\n群组：%s\n用户名：@%s\nID：`%d`",
+				groupName, groupUsername, groupID)
+		} else {
+			responseText = fmt.Sprintf("✅ 已添加授权群组\n\n群组：%s\nID：`%d`\n\n💡 提示：这是私密群组",
+				groupName, groupID)
+		}
+	} else {
+		responseText = fmt.Sprintf("✅ 已添加授权群组\n\nID：`%d`\n\n⚠️ 机器人未在群中，无法获取群组信息\n💡 邀请机器人进群后会自动更新群组名称",
+			groupID)
+	}
+
+	h.sendReply(message.Chat.ID, message.MessageID, responseText)
 }
 
-// handleWaitingAdminID 处理等待管理员ID输入
+// handleWaitingAdminID 处理等待管理员ID输入（仅私聊）
 func (h *Handler) handleWaitingAdminID(message *tgbotapi.Message) {
+	// 确保在私聊中
+	if !message.Chat.IsPrivate() {
+		logrus.Warn("尝试在非私聊中处理管理员ID输入，已忽略")
+		return
+	}
+
 	// 解析用户ID
 	userID, err := strconv.ParseInt(strings.TrimSpace(message.Text), 10, 64)
 	if err != nil {
@@ -424,8 +496,14 @@ func (h *Handler) handleWaitingAdminID(message *tgbotapi.Message) {
 	h.sendReply(message.Chat.ID, message.MessageID, fmt.Sprintf("✅ 已添加全局管理员\n\nID：`%d`", userID))
 }
 
-// handleWaitingChannelID 处理等待通知频道ID输入
+// handleWaitingChannelID 处理等待通知频道ID输入（仅私聊）
 func (h *Handler) handleWaitingChannelID(message *tgbotapi.Message) {
+	// 确保在私聊中
+	if !message.Chat.IsPrivate() {
+		logrus.Warn("尝试在非私聊中处理频道ID输入，已忽略")
+		return
+	}
+
 	// 解析频道ID
 	channelID, err := strconv.ParseInt(strings.TrimSpace(message.Text), 10, 64)
 	if err != nil {

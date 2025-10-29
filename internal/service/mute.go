@@ -5,6 +5,8 @@ import (
 	"admin-bot/internal/models"
 	"admin-bot/internal/utils"
 	"time"
+
+	"github.com/sirupsen/logrus"
 )
 
 // MuteService 禁言服务
@@ -18,6 +20,13 @@ func NewMuteService() *MuteService {
 // MuteUser 禁言用户
 func (s *MuteService) MuteUser(userID int64, username, fullName string, groupID int64, groupName string,
 	operatorID int64, operatorName string, reason string, duration int) error {
+
+	// 安全处理字符串，防止编码问题
+	username = utils.SafeUsername(username)
+	fullName = utils.SafeFullName(fullName)
+	groupName = utils.SafeGroupName(groupName)
+	operatorName = utils.SafeFullName(operatorName)
+	reason = utils.SafeReason(reason)
 
 	expireAt := utils.CalculateExpireTime(duration)
 	var durationPtr *int
@@ -39,7 +48,15 @@ func (s *MuteService) MuteUser(userID int64, username, fullName string, groupID 
 		Status:       1,
 	}
 
-	return database.DB.Create(mute).Error
+	err := database.DB.Create(mute).Error
+	if err != nil {
+		logrus.WithFields(logrus.Fields{
+			"用户ID": userID,
+			"群组ID": groupID,
+			"错误信息": err.Error(),
+		}).Error("❌ 保存禁言记录失败")
+	}
+	return err
 }
 
 // UnmuteUser 解除禁言
@@ -48,10 +65,10 @@ func (s *MuteService) UnmuteUser(userID int64, reason string, unmuteBy int64) er
 	return database.DB.Model(&models.MuteList{}).
 		Where("user_id = ? AND status = 1", userID).
 		Updates(map[string]interface{}{
-			"status":         0,
-			"unmute_reason":  reason,
-			"unmute_at":      now,
-			"unmute_by":      unmuteBy,
+			"status":        0,
+			"unmute_reason": reason,
+			"unmute_at":     now,
+			"unmute_by":     unmuteBy,
 		}).Error
 }
 
@@ -113,4 +130,3 @@ func (s *MuteService) GetUserMuteHistory(userID int64) ([]models.MuteList, error
 		Find(&mutes).Error
 	return mutes, err
 }
-

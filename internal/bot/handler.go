@@ -22,6 +22,7 @@ type Handler struct {
 	adminService         *service.AdminService
 	logService           *service.LogService
 	notificationService  *service.NotificationService
+	userCacheService     *service.UserCacheService
 	rateLimiter          *utils.RateLimiter
 	notifiedUnauthorized map[int64]bool // 记录已通知的未授权群组
 }
@@ -34,7 +35,8 @@ func NewHandler(bot *tgbotapi.BotAPI, cfg *config.Config,
 	groupService *service.GroupService,
 	adminService *service.AdminService,
 	logService *service.LogService,
-	notificationService *service.NotificationService) *Handler {
+	notificationService *service.NotificationService,
+	userCacheService *service.UserCacheService) *Handler {
 
 	return &Handler{
 		bot:                  bot,
@@ -46,8 +48,16 @@ func NewHandler(bot *tgbotapi.BotAPI, cfg *config.Config,
 		adminService:         adminService,
 		logService:           logService,
 		notificationService:  notificationService,
+		userCacheService:     userCacheService,
 		rateLimiter:          utils.NewRateLimiter(cfg.System.RateLimitPerGroup),
 		notifiedUnauthorized: make(map[int64]bool),
+	}
+}
+
+// CacheUserInfo 缓存用户信息
+func (h *Handler) CacheUserInfo(user *tgbotapi.User) {
+	if user.UserName != "" {
+		h.userCacheService.SaveOrUpdateUser(user.ID, user.UserName, user.FirstName, user.LastName)
 	}
 }
 
@@ -101,6 +111,8 @@ func (h *Handler) HandleMessage(message *tgbotapi.Message) {
 		h.handleStart(message)
 	case "help":
 		h.handleHelp(message)
+	case "cancel":
+		h.handleCancel(message)
 	case "t":
 		h.handleKick(message)
 	case "lh":
@@ -133,7 +145,8 @@ func (h *Handler) handleHelp(message *tgbotapi.Message) {
 		"/lh \\[时间\\] \\[理由\\] - 拉黑用户\n" +
 		"/unlh \\[理由\\] - 解除拉黑\n" +
 		"/jy \\[时间\\] \\[理由\\] - 禁言用户\n" +
-		"/unjy \\[理由\\] - 解除禁言\n\n" +
+		"/unjy \\[理由\\] - 解除禁言\n" +
+		"/cancel - 取消当前操作\n\n" +
 		"*使用方式：*\n" +
 		"\\- 引用回复目标用户的消息\n" +
 		"\\- 或在命令后指定 @username\n\n" +
@@ -144,6 +157,35 @@ func (h *Handler) handleHelp(message *tgbotapi.Message) {
 		"`/lh 1d 刷屏`"
 
 	h.sendReply(message.Chat.ID, message.MessageID, text)
+}
+
+// handleCancel 处理 /cancel 命令（取消当前对话操作）
+func (h *Handler) handleCancel(message *tgbotapi.Message) {
+	// 只在私聊中有效
+	if !message.Chat.IsPrivate() {
+		return
+	}
+
+	// 只允许作者取消对话
+	if message.From.ID != h.cfg.Telegram.AuthorID {
+		return
+	}
+
+	// 检查是否有待处理的状态
+	state := getUserState(message.From.ID)
+
+	// 无论是否有状态，都尝试清除（确保彻底清理）
+	clearUserState(message.From.ID)
+
+	if state == nil {
+		h.sendReply(message.Chat.ID, message.MessageID, "✅ 已清除所有对话状态")
+	} else {
+		h.sendReply(message.Chat.ID, message.MessageID, "✅ 已取消当前操作并清除所有对话状态")
+		logrus.WithFields(logrus.Fields{
+			"用户ID": message.From.ID,
+			"状态":   state.State,
+		}).Info("🚫 用户取消了对话操作")
+	}
 }
 
 // handleKick 处理踢出命令
@@ -167,7 +209,7 @@ func (h *Handler) handleKick(message *tgbotapi.Message) {
 	}).Debug("✅ 权限检查通过")
 
 	// 解析命令
-	params, err := ParseCommand(message, h.bot)
+	params, err := ParseCommand(message, h.bot, h.userCacheService)
 	if err != nil {
 		h.sendReply(message.Chat.ID, message.MessageID, fmt.Sprintf("❌ %s", err.Error()))
 		return
@@ -178,10 +220,17 @@ func (h *Handler) handleKick(message *tgbotapi.Message) {
 	groupName := GetChatTitle(message.Chat)
 	groupUsername := GetChatUsername(message.Chat)
 
+	// 获取所有授权群组
+	authorizedGroups, err := h.groupService.GetAuthorizedGroups()
+	if err != nil {
+		logrus.Errorf("Failed to get authorized groups: %v", err)
+		authorizedGroups = []models.AuthorizedGroup{}
+	}
+
 	successCount := 0
 	failedCount := 0
 
-	// 批量处理
+	// 处理所有目标用户
 	for _, targetUserID := range params.TargetUsers {
 		// 限流
 		h.rateLimiter.Wait(message.Chat.ID)
@@ -203,34 +252,42 @@ func (h *Handler) handleKick(message *tgbotapi.Message) {
 
 		targetUsername, targetName := GetUserInfo(chatMember.User)
 
-		// 执行踢出
-		kickConfig := tgbotapi.KickChatMemberConfig{
-			ChatMemberConfig: tgbotapi.ChatMemberConfig{
-				ChatID: message.Chat.ID,
-				UserID: targetUserID,
-			},
+		// 在所有授权群组中执行踢出
+		groupSuccessCount := 0
+		for _, group := range authorizedGroups {
+			h.rateLimiter.Wait(group.GroupID)
+
+			// 执行踢出
+			kickConfig := tgbotapi.KickChatMemberConfig{
+				ChatMemberConfig: tgbotapi.ChatMemberConfig{
+					ChatID: group.GroupID,
+					UserID: targetUserID,
+				},
+			}
+
+			_, err = h.bot.Request(kickConfig)
+			if err != nil {
+				logrus.Errorf("Failed to kick user in group %d: %v", group.GroupID, err)
+			} else {
+				// 解除封禁（允许用户再次加入）
+				unbanConfig := tgbotapi.UnbanChatMemberConfig{
+					ChatMemberConfig: tgbotapi.ChatMemberConfig{
+						ChatID: group.GroupID,
+						UserID: targetUserID,
+					},
+				}
+				h.bot.Request(unbanConfig)
+				groupSuccessCount++
+			}
 		}
 
-		_, err = h.bot.Request(kickConfig)
-		if err != nil {
-			logrus.Errorf("Failed to kick user: %v", err)
-			h.logService.LogOperation(models.OpTypeKick, targetUserID, targetUsername,
-				message.Chat.ID, groupName, message.From.ID, operatorName,
-				"", nil, false, err.Error())
-			h.notificationService.SendErrorNotification(groupName, "踢出", targetName,
-				targetUserID, err.Error(), operatorName)
+		// 如果所有群组都失败，则标记为失败
+		if groupSuccessCount == 0 {
 			failedCount++
+			h.notificationService.SendErrorNotification(groupName, "踢出", targetName,
+				targetUserID, "所有群组踢出失败", operatorName)
 			continue
 		}
-
-		// 解除封禁（允许用户再次加入）
-		unbanConfig := tgbotapi.UnbanChatMemberConfig{
-			ChatMemberConfig: tgbotapi.ChatMemberConfig{
-				ChatID: message.Chat.ID,
-				UserID: targetUserID,
-			},
-		}
-		h.bot.Request(unbanConfig)
 
 		// 记录日志
 		h.logService.LogOperation(models.OpTypeKick, targetUserID, targetUsername,
@@ -241,18 +298,34 @@ func (h *Handler) handleKick(message *tgbotapi.Message) {
 		h.notificationService.SendKickNotification(message.Chat.ID, groupName, groupUsername,
 			targetName, targetUserID, operatorName, message.From.ID)
 
+		logrus.WithFields(logrus.Fields{
+			"用户ID": targetUserID,
+			"成功数量": groupSuccessCount,
+			"总群组数": len(authorizedGroups),
+		}).Info("✅ 用户已在多个群组中被踢出")
+
 		successCount++
 	}
 
 	// 发送操作结果反馈
-	if failedCount == 0 {
-		h.sendReply(message.Chat.ID, message.MessageID, "✅ 踢出操作成功")
+	if params.IsBatch {
+		// 批量操作显示详细结果
+		if failedCount == 0 {
+			h.sendReply(message.Chat.ID, message.MessageID, fmt.Sprintf("✅ 踢出操作成功（%d/%d）", successCount, len(params.TargetUsers)))
+		} else {
+			h.sendReply(message.Chat.ID, message.MessageID, fmt.Sprintf("⚠️ 踢出操作完成，成功 %d，失败 %d", successCount, failedCount))
+		}
 	} else {
-		h.sendReply(message.Chat.ID, message.MessageID, "⚠️ 踢出操作完成，部分失败")
+		// 单用户操作简单反馈
+		if successCount > 0 {
+			h.sendReply(message.Chat.ID, message.MessageID, "✅ 踢出操作成功")
+		} else {
+			h.sendReply(message.Chat.ID, message.MessageID, "❌ 踢出操作失败")
+		}
 	}
 }
 
-// handleBan 处理拉黑命令
+// handleBan 处理拉黑命令（异步优化版本）
 func (h *Handler) handleBan(message *tgbotapi.Message) {
 	// 检查权限
 	hasPermission, reason := h.permissionChecker.CheckPermission(message)
@@ -273,11 +346,14 @@ func (h *Handler) handleBan(message *tgbotapi.Message) {
 	}).Debug("✅ 权限检查通过")
 
 	// 解析命令
-	params, err := ParseCommand(message, h.bot)
+	params, err := ParseCommand(message, h.bot, h.userCacheService)
 	if err != nil {
 		h.sendReply(message.Chat.ID, message.MessageID, fmt.Sprintf("❌ %s", err.Error()))
 		return
 	}
+
+	// 立即发送"处理中"反馈，提升响应速度
+	processingMsg := h.sendReplyAndGetMessage(message.Chat.ID, message.MessageID, "⏳ 正在处理拉黑操作...")
 
 	// 获取操作人信息
 	_, operatorName := GetUserInfo(message.From)
@@ -291,92 +367,136 @@ func (h *Handler) handleBan(message *tgbotapi.Message) {
 		authorizedGroups = []models.AuthorizedGroup{}
 	}
 
-	successCount := 0
-	failedCount := 0
+	// 异步处理所有用户
+	go func() {
+		successCount := 0
+		failedCount := 0
 
-	// 批量处理
-	for _, targetUserID := range params.TargetUsers {
-		// 限流
-		h.rateLimiter.Wait(message.Chat.ID)
+		// 批量处理
+		for _, targetUserID := range params.TargetUsers {
+			// 限流
+			h.rateLimiter.Wait(message.Chat.ID)
 
-		// 获取目标用户信息
-		chatMember, err := h.bot.GetChatMember(tgbotapi.GetChatMemberConfig{
-			ChatConfigWithUser: tgbotapi.ChatConfigWithUser{
-				ChatID: message.Chat.ID,
-				UserID: targetUserID,
-			},
-		})
-
-		if err != nil {
-			logrus.Errorf("Failed to get chat member: %v", err)
-			h.notificationService.SendErrorNotification(groupName, "拉黑", fmt.Sprintf("%d", targetUserID),
-				targetUserID, err.Error(), operatorName)
-			failedCount++
-			continue
-		}
-
-		targetUsername, targetName := GetUserInfo(chatMember.User)
-
-		// 保存到数据库
-		err = h.banService.BanUser(targetUserID, targetUsername, targetName,
-			message.Chat.ID, groupName, message.From.ID, operatorName,
-			params.Reason, params.Duration)
-
-		if err != nil {
-			logrus.Errorf("Failed to save ban record: %v", err)
-			failedCount++
-			continue
-		}
-
-		// 在所有授权群组中执行拉黑
-		groupSuccessCount := 0
-		for _, group := range authorizedGroups {
-			h.rateLimiter.Wait(group.GroupID)
-
-			kickConfig := tgbotapi.KickChatMemberConfig{
-				ChatMemberConfig: tgbotapi.ChatMemberConfig{
-					ChatID: group.GroupID,
+			// 获取目标用户信息
+			chatMember, err := h.bot.GetChatMember(tgbotapi.GetChatMemberConfig{
+				ChatConfigWithUser: tgbotapi.ChatConfigWithUser{
+					ChatID: message.Chat.ID,
 					UserID: targetUserID,
 				},
-			}
+			})
 
-			if params.Duration > 0 {
-				kickConfig.UntilDate = int64(params.Duration)
-			}
-
-			_, err = h.bot.Request(kickConfig)
 			if err != nil {
-				logrus.Errorf("Failed to ban user in group %d: %v", group.GroupID, err)
+				logrus.Errorf("Failed to get chat member: %v", err)
+				h.notificationService.SendErrorNotification(groupName, "拉黑", fmt.Sprintf("%d", targetUserID),
+					targetUserID, err.Error(), operatorName)
+				failedCount++
+				continue
+			}
+
+			targetUsername, targetName := GetUserInfo(chatMember.User)
+
+			// 并发执行多群组拉黑操作
+			var banSuccess int
+			var banFailed int
+			tasks := make([]func(), 0, len(authorizedGroups))
+
+			for _, group := range authorizedGroups {
+				grp := group // 捕获变量
+				tasks = append(tasks, func() {
+					h.rateLimiter.Wait(grp.GroupID)
+
+					kickConfig := tgbotapi.KickChatMemberConfig{
+						ChatMemberConfig: tgbotapi.ChatMemberConfig{
+							ChatID: grp.GroupID,
+							UserID: targetUserID,
+						},
+					}
+
+					if params.Duration > 0 {
+						kickConfig.UntilDate = int64(params.Duration)
+					}
+
+					_, err := h.bot.Request(kickConfig)
+					if err != nil {
+						logrus.Errorf("Failed to ban user in group %d: %v", grp.GroupID, err)
+						banFailed++
+					} else {
+						banSuccess++
+					}
+				})
+			}
+
+			// 并发执行所有群组的拉黑操作
+			utils.ParallelExecuteWithLimit(tasks, 5)
+
+			// 只有至少一个群组成功才算成功
+			if banSuccess > 0 {
+				successCount++
+
+				// 异步保存到数据库并记录日志（不阻塞核心功能）
+				go func(uid int64, uname, fname string) {
+					// 保存到数据库
+					err := h.banService.BanUser(uid, uname, fname,
+						message.Chat.ID, groupName, message.From.ID, operatorName,
+						params.Reason, params.Duration)
+					if err != nil {
+						// 数据库保存失败不影响用户反馈，但记录详细错误
+						logrus.WithFields(logrus.Fields{
+							"用户ID": uid,
+							"用户名":  uname,
+							"群组":   groupName,
+							"错误":   err.Error(),
+						}).Error("❌ 数据库保存失败（Telegram操作已成功）")
+					}
+
+					// 记录操作日志
+					durationPtr := &params.Duration
+					h.logService.LogOperation(models.OpTypeBan, uid, uname,
+						message.Chat.ID, groupName, message.From.ID, operatorName,
+						params.Reason, durationPtr, true, "")
+				}(targetUserID, targetUsername, targetName)
+
+				// 发送通知（已经是异步的）
+				h.notificationService.SendBanNotification(message.Chat.ID, groupName, groupUsername,
+					targetName, targetUserID, params.Duration, params.Reason, operatorName, message.From.ID)
+
+				logrus.WithFields(logrus.Fields{
+					"用户ID":  targetUserID,
+					"用户名":   targetName,
+					"成功群组数": banSuccess,
+					"失败群组数": banFailed,
+					"总群组数":  len(authorizedGroups),
+				}).Info("✅ 拉黑操作完成")
 			} else {
-				groupSuccessCount++
+				failedCount++
 			}
 		}
 
-		// 记录日志
-		durationPtr := &params.Duration
-		h.logService.LogOperation(models.OpTypeBan, targetUserID, targetUsername,
-			message.Chat.ID, groupName, message.From.ID, operatorName,
-			params.Reason, durationPtr, true, "")
+		// 更新消息状态
+		var resultText string
+		if params.IsBatch {
+			// 批量操作显示详细结果
+			if failedCount == 0 {
+				resultText = fmt.Sprintf("✅ 拉黑操作成功（%d/%d）", successCount, len(params.TargetUsers))
+			} else {
+				resultText = fmt.Sprintf("⚠️ 拉黑操作完成，成功 %d，失败 %d", successCount, failedCount)
+			}
+		} else {
+			// 单用户操作简单反馈
+			if successCount > 0 {
+				resultText = "✅ 拉黑操作成功"
+			} else {
+				resultText = "❌ 拉黑操作失败"
+			}
+		}
 
-		// 发送通知
-		h.notificationService.SendBanNotification(message.Chat.ID, groupName, groupUsername,
-			targetName, targetUserID, params.Duration, params.Reason, operatorName, message.From.ID)
-
-		logrus.WithFields(logrus.Fields{
-			"用户ID": targetUserID,
-			"成功数量": groupSuccessCount,
-			"总群组数": len(authorizedGroups),
-		}).Info("✅ 用户已在多个群组中被拉黑")
-
-		successCount++
-	}
-
-	// 发送操作结果反馈
-	if failedCount == 0 {
-		h.sendReply(message.Chat.ID, message.MessageID, "✅ 拉黑操作成功")
-	} else {
-		h.sendReply(message.Chat.ID, message.MessageID, "⚠️ 拉黑操作完成，部分失败")
-	}
+		// 更新处理中的消息
+		if processingMsg != nil {
+			h.editMessage(message.Chat.ID, processingMsg.MessageID, resultText)
+		} else {
+			h.sendReply(message.Chat.ID, message.MessageID, resultText)
+		}
+	}()
 }
 
 // handleUnban 处理解除拉黑命令
@@ -389,7 +509,7 @@ func (h *Handler) handleUnban(message *tgbotapi.Message) {
 	}
 
 	// 解析命令
-	params, err := ParseCommand(message, h.bot)
+	params, err := ParseCommand(message, h.bot, h.userCacheService)
 	if err != nil {
 		h.sendReply(message.Chat.ID, message.MessageID, fmt.Sprintf("❌ %s", err.Error()))
 		return
@@ -410,7 +530,7 @@ func (h *Handler) handleUnban(message *tgbotapi.Message) {
 	successCount := 0
 	failedCount := 0
 
-	// 批量处理
+	// 处理所有目标用户
 	for _, targetUserID := range params.TargetUsers {
 		// 限流
 		h.rateLimiter.Wait(message.Chat.ID)
@@ -468,14 +588,24 @@ func (h *Handler) handleUnban(message *tgbotapi.Message) {
 	}
 
 	// 发送操作结果反馈
-	if failedCount == 0 {
-		h.sendReply(message.Chat.ID, message.MessageID, "✅ 解除拉黑操作成功")
+	if params.IsBatch {
+		// 批量操作显示详细结果
+		if failedCount == 0 {
+			h.sendReply(message.Chat.ID, message.MessageID, fmt.Sprintf("✅ 解除拉黑操作成功（%d/%d）", successCount, len(params.TargetUsers)))
+		} else {
+			h.sendReply(message.Chat.ID, message.MessageID, fmt.Sprintf("⚠️ 解除拉黑操作完成，成功 %d，失败 %d", successCount, failedCount))
+		}
 	} else {
-		h.sendReply(message.Chat.ID, message.MessageID, "⚠️ 解除拉黑操作完成，部分失败")
+		// 单用户操作简单反馈
+		if successCount > 0 {
+			h.sendReply(message.Chat.ID, message.MessageID, "✅ 解除拉黑操作成功")
+		} else {
+			h.sendReply(message.Chat.ID, message.MessageID, "❌ 解除拉黑操作失败")
+		}
 	}
 }
 
-// handleMute 处理禁言命令
+// handleMute 处理禁言命令（异步优化版本）
 func (h *Handler) handleMute(message *tgbotapi.Message) {
 	// 检查权限
 	hasPermission, reason := h.permissionChecker.CheckPermission(message)
@@ -496,11 +626,14 @@ func (h *Handler) handleMute(message *tgbotapi.Message) {
 	}).Debug("✅ 权限检查通过")
 
 	// 解析命令
-	params, err := ParseCommand(message, h.bot)
+	params, err := ParseCommand(message, h.bot, h.userCacheService)
 	if err != nil {
 		h.sendReply(message.Chat.ID, message.MessageID, fmt.Sprintf("❌ %s", err.Error()))
 		return
 	}
+
+	// 立即发送"处理中"反馈，提升响应速度
+	processingMsg := h.sendReplyAndGetMessage(message.Chat.ID, message.MessageID, "⏳ 正在处理禁言操作...")
 
 	// 获取操作人信息
 	_, operatorName := GetUserInfo(message.From)
@@ -514,86 +647,139 @@ func (h *Handler) handleMute(message *tgbotapi.Message) {
 		authorizedGroups = []models.AuthorizedGroup{}
 	}
 
-	successCount := 0
-	failedCount := 0
+	// 异步处理所有用户
+	go func() {
+		successCount := 0
+		failedCount := 0
 
-	// 批量处理
-	for _, targetUserID := range params.TargetUsers {
-		// 限流
-		h.rateLimiter.Wait(message.Chat.ID)
+		// 批量处理
+		for _, targetUserID := range params.TargetUsers {
+			// 限流
+			h.rateLimiter.Wait(message.Chat.ID)
 
-		// 获取目标用户信息
-		chatMember, err := h.bot.GetChatMember(tgbotapi.GetChatMemberConfig{
-			ChatConfigWithUser: tgbotapi.ChatConfigWithUser{
-				ChatID: message.Chat.ID,
-				UserID: targetUserID,
-			},
-		})
-
-		if err != nil {
-			logrus.Errorf("Failed to get chat member: %v", err)
-			h.notificationService.SendErrorNotification(groupName, "禁言", fmt.Sprintf("%d", targetUserID),
-				targetUserID, err.Error(), operatorName)
-			failedCount++
-			continue
-		}
-
-		targetUsername, targetName := GetUserInfo(chatMember.User)
-
-		// 保存到数据库
-		err = h.muteService.MuteUser(targetUserID, targetUsername, targetName,
-			message.Chat.ID, groupName, message.From.ID, operatorName,
-			params.Reason, params.Duration)
-
-		if err != nil {
-			logrus.Errorf("Failed to save mute record: %v", err)
-			failedCount++
-			continue
-		}
-
-		// 在所有授权群组中执行禁言
-		for _, group := range authorizedGroups {
-			h.rateLimiter.Wait(group.GroupID)
-
-			restrictConfig := tgbotapi.RestrictChatMemberConfig{
-				ChatMemberConfig: tgbotapi.ChatMemberConfig{
-					ChatID: group.GroupID,
+			// 获取目标用户信息
+			chatMember, err := h.bot.GetChatMember(tgbotapi.GetChatMemberConfig{
+				ChatConfigWithUser: tgbotapi.ChatConfigWithUser{
+					ChatID: message.Chat.ID,
 					UserID: targetUserID,
 				},
-				Permissions: &tgbotapi.ChatPermissions{
-					CanSendMessages: false,
-				},
-			}
+			})
 
-			if params.Duration > 0 {
-				restrictConfig.UntilDate = int64(params.Duration)
-			}
-
-			_, err = h.bot.Request(restrictConfig)
 			if err != nil {
-				logrus.Errorf("Failed to mute user in group %d: %v", group.GroupID, err)
+				logrus.Errorf("Failed to get chat member: %v", err)
+				h.notificationService.SendErrorNotification(groupName, "禁言", fmt.Sprintf("%d", targetUserID),
+					targetUserID, err.Error(), operatorName)
+				failedCount++
+				continue
+			}
+
+			targetUsername, targetName := GetUserInfo(chatMember.User)
+
+			// 并发执行多群组禁言操作
+			var muteSuccess int
+			var muteFailed int
+			tasks := make([]func(), 0, len(authorizedGroups))
+
+			for _, group := range authorizedGroups {
+				grp := group // 捕获变量
+				tasks = append(tasks, func() {
+					h.rateLimiter.Wait(grp.GroupID)
+
+					restrictConfig := tgbotapi.RestrictChatMemberConfig{
+						ChatMemberConfig: tgbotapi.ChatMemberConfig{
+							ChatID: grp.GroupID,
+							UserID: targetUserID,
+						},
+						Permissions: &tgbotapi.ChatPermissions{
+							CanSendMessages: false,
+						},
+					}
+
+					if params.Duration > 0 {
+						restrictConfig.UntilDate = int64(params.Duration)
+					}
+
+					_, err := h.bot.Request(restrictConfig)
+					if err != nil {
+						logrus.Errorf("Failed to mute user in group %d: %v", grp.GroupID, err)
+						muteFailed++
+					} else {
+						muteSuccess++
+					}
+				})
+			}
+
+			// 并发执行所有群组的禁言操作
+			utils.ParallelExecuteWithLimit(tasks, 5)
+
+			// 只有至少一个群组成功才算成功
+			if muteSuccess > 0 {
+				successCount++
+
+				// 异步保存到数据库并记录日志（不阻塞核心功能）
+				go func(uid int64, uname, fname string) {
+					// 保存到数据库
+					err := h.muteService.MuteUser(uid, uname, fname,
+						message.Chat.ID, groupName, message.From.ID, operatorName,
+						params.Reason, params.Duration)
+					if err != nil {
+						// 数据库保存失败不影响用户反馈，但记录详细错误
+						logrus.WithFields(logrus.Fields{
+							"用户ID": uid,
+							"用户名":  uname,
+							"群组":   groupName,
+							"错误":   err.Error(),
+						}).Error("❌ 数据库保存失败（Telegram操作已成功）")
+					}
+
+					// 记录操作日志
+					durationPtr := &params.Duration
+					h.logService.LogOperation(models.OpTypeMute, uid, uname,
+						message.Chat.ID, groupName, message.From.ID, operatorName,
+						params.Reason, durationPtr, true, "")
+				}(targetUserID, targetUsername, targetName)
+
+				// 发送通知（已经是异步的）
+				h.notificationService.SendMuteNotification(message.Chat.ID, groupName, groupUsername,
+					targetName, targetUserID, params.Duration, params.Reason, operatorName, message.From.ID)
+
+				logrus.WithFields(logrus.Fields{
+					"用户ID":  targetUserID,
+					"用户名":   targetName,
+					"成功群组数": muteSuccess,
+					"失败群组数": muteFailed,
+					"总群组数":  len(authorizedGroups),
+				}).Info("✅ 禁言操作完成")
+			} else {
+				failedCount++
 			}
 		}
 
-		// 记录日志
-		durationPtr := &params.Duration
-		h.logService.LogOperation(models.OpTypeMute, targetUserID, targetUsername,
-			message.Chat.ID, groupName, message.From.ID, operatorName,
-			params.Reason, durationPtr, true, "")
+		// 更新消息状态
+		var resultText string
+		if params.IsBatch {
+			// 批量操作显示详细结果
+			if failedCount == 0 {
+				resultText = fmt.Sprintf("✅ 禁言操作成功（%d/%d）", successCount, len(params.TargetUsers))
+			} else {
+				resultText = fmt.Sprintf("⚠️ 禁言操作完成，成功 %d，失败 %d", successCount, failedCount)
+			}
+		} else {
+			// 单用户操作简单反馈
+			if successCount > 0 {
+				resultText = "✅ 禁言操作成功"
+			} else {
+				resultText = "❌ 禁言操作失败"
+			}
+		}
 
-		// 发送通知
-		h.notificationService.SendMuteNotification(message.Chat.ID, groupName, groupUsername,
-			targetName, targetUserID, params.Duration, params.Reason, operatorName, message.From.ID)
-
-		successCount++
-	}
-
-	// 发送操作结果反馈
-	if failedCount == 0 {
-		h.sendReply(message.Chat.ID, message.MessageID, "✅ 禁言操作成功")
-	} else {
-		h.sendReply(message.Chat.ID, message.MessageID, "⚠️ 禁言操作完成，部分失败")
-	}
+		// 更新处理中的消息
+		if processingMsg != nil {
+			h.editMessage(message.Chat.ID, processingMsg.MessageID, resultText)
+		} else {
+			h.sendReply(message.Chat.ID, message.MessageID, resultText)
+		}
+	}()
 }
 
 // handleUnmute 处理解除禁言命令
@@ -606,7 +792,7 @@ func (h *Handler) handleUnmute(message *tgbotapi.Message) {
 	}
 
 	// 解析命令
-	params, err := ParseCommand(message, h.bot)
+	params, err := ParseCommand(message, h.bot, h.userCacheService)
 	if err != nil {
 		h.sendReply(message.Chat.ID, message.MessageID, fmt.Sprintf("❌ %s", err.Error()))
 		return
@@ -695,10 +881,20 @@ func (h *Handler) handleUnmute(message *tgbotapi.Message) {
 	}
 
 	// 发送操作结果反馈
-	if failedCount == 0 {
-		h.sendReply(message.Chat.ID, message.MessageID, "✅ 解除禁言操作成功")
+	if params.IsBatch {
+		// 批量操作显示详细结果
+		if failedCount == 0 {
+			h.sendReply(message.Chat.ID, message.MessageID, fmt.Sprintf("✅ 解除禁言操作成功（%d/%d）", successCount, len(params.TargetUsers)))
+		} else {
+			h.sendReply(message.Chat.ID, message.MessageID, fmt.Sprintf("⚠️ 解除禁言操作完成，成功 %d，失败 %d", successCount, failedCount))
+		}
 	} else {
-		h.sendReply(message.Chat.ID, message.MessageID, "⚠️ 解除禁言操作完成，部分失败")
+		// 单用户操作简单反馈
+		if successCount > 0 {
+			h.sendReply(message.Chat.ID, message.MessageID, "✅ 解除禁言操作成功")
+		} else {
+			h.sendReply(message.Chat.ID, message.MessageID, "❌ 解除禁言操作失败")
+		}
 	}
 }
 
@@ -757,6 +953,7 @@ func (h *Handler) showConfigMenu(chatID int64) {
 func (h *Handler) sendReply(chatID int64, replyToMessageID int, text string) {
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ReplyToMessageID = replyToMessageID
+	msg.DisableWebPagePreview = true // 禁用链接预览，避免占用空间
 
 	_, err := h.bot.Send(msg)
 	if err != nil {
@@ -764,9 +961,89 @@ func (h *Handler) sendReply(chatID int64, replyToMessageID int, text string) {
 	}
 }
 
+// sendReplyAndGetMessage 发送回复消息并返回消息对象
+func (h *Handler) sendReplyAndGetMessage(chatID int64, replyToMessageID int, text string) *tgbotapi.Message {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ReplyToMessageID = replyToMessageID
+	msg.DisableWebPagePreview = true // 禁用链接预览，避免占用空间
+
+	sentMsg, err := h.bot.Send(msg)
+	if err != nil {
+		logrus.Errorf("Failed to send reply: %v", err)
+		return nil
+	}
+	return &sentMsg
+}
+
+// editMessage 编辑消息内容
+func (h *Handler) editMessage(chatID int64, messageID int, text string) {
+	msg := tgbotapi.NewEditMessageText(chatID, messageID, text)
+	msg.DisableWebPagePreview = true
+
+	_, err := h.bot.Send(msg)
+	if err != nil {
+		logrus.Errorf("Failed to edit message: %v", err)
+	}
+}
+
+// CheckBotAddedToGroup 检查机器人是否被添加到群组
+func (h *Handler) CheckBotAddedToGroup(message *tgbotapi.Message, botID int64) {
+	if len(message.NewChatMembers) == 0 {
+		return
+	}
+
+	// 检查新成员中是否包含机器人自己
+	var isBotAdded bool
+	for _, member := range message.NewChatMembers {
+		if member.ID == botID {
+			isBotAdded = true
+			break
+		}
+	}
+
+	if !isBotAdded {
+		return
+	}
+
+	// 机器人被添加到群组，检查是否为授权群组
+	groupID := message.Chat.ID
+	groupName := message.Chat.Title
+	groupUsername := message.Chat.UserName
+
+	// 检查群组是否已授权
+	isAuthorized, err := h.groupService.IsAuthorized(groupID)
+	if err != nil {
+		logrus.Errorf("Failed to check group authorization: %v", err)
+		return
+	}
+
+	if isAuthorized {
+		// 已授权群组，更新群组信息
+		err = h.groupService.UpdateGroupInfo(groupID, groupName, groupUsername)
+		if err != nil {
+			logrus.WithFields(logrus.Fields{
+				"群组ID": groupID,
+				"错误":   err.Error(),
+			}).Error("❌ 更新群组信息失败")
+		} else {
+			logrus.WithFields(logrus.Fields{
+				"群组ID": groupID,
+				"群组名":  groupName,
+				"用户名":  groupUsername,
+			}).Info("✅ 机器人加入授权群组，已更新群组信息")
+		}
+	} else {
+		// 未授权群组，记录日志（后续会由 CheckUnauthorizedGroup 处理退出）
+		logrus.WithFields(logrus.Fields{
+			"群组ID": groupID,
+			"群组名":  groupName,
+		}).Warn("⚠️ 机器人被添加到未授权群组")
+	}
+}
+
 // CheckNewMember 检查新成员
 func (h *Handler) CheckNewMember(message *tgbotapi.Message) {
-	if message.NewChatMembers == nil || len(message.NewChatMembers) == 0 {
+	if len(message.NewChatMembers) == 0 {
 		return
 	}
 

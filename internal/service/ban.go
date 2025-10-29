@@ -5,6 +5,8 @@ import (
 	"admin-bot/internal/models"
 	"admin-bot/internal/utils"
 	"time"
+
+	"github.com/sirupsen/logrus"
 )
 
 // BanService 拉黑服务
@@ -18,6 +20,13 @@ func NewBanService() *BanService {
 // BanUser 拉黑用户
 func (s *BanService) BanUser(userID int64, username, fullName string, groupID int64, groupName string,
 	operatorID int64, operatorName string, reason string, duration int) error {
+
+	// 安全处理字符串，防止编码问题
+	username = utils.SafeUsername(username)
+	fullName = utils.SafeFullName(fullName)
+	groupName = utils.SafeGroupName(groupName)
+	operatorName = utils.SafeFullName(operatorName)
+	reason = utils.SafeReason(reason)
 
 	expireAt := utils.CalculateExpireTime(duration)
 	var durationPtr *int
@@ -39,7 +48,15 @@ func (s *BanService) BanUser(userID int64, username, fullName string, groupID in
 		Status:       1,
 	}
 
-	return database.DB.Create(ban).Error
+	err := database.DB.Create(ban).Error
+	if err != nil {
+		logrus.WithFields(logrus.Fields{
+			"用户ID": userID,
+			"群组ID": groupID,
+			"错误信息": err.Error(),
+		}).Error("❌ 保存拉黑记录失败")
+	}
+	return err
 }
 
 // UnbanUser 解除拉黑
@@ -113,4 +130,3 @@ func (s *BanService) GetUserBanHistory(userID int64) ([]models.Blacklist, error)
 		Find(&bans).Error
 	return bans, err
 }
-

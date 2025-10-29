@@ -37,6 +37,16 @@ func (s *GroupService) AddAuthorizedGroup(groupID int64, groupName string) error
 	return database.DB.Create(group).Error
 }
 
+// AddAuthorizedGroupWithUsername 添加授权群组（包含用户名）
+func (s *GroupService) AddAuthorizedGroupWithUsername(groupID int64, groupName, username string) error {
+	group := &models.AuthorizedGroup{
+		GroupID:   groupID,
+		GroupName: groupName,
+		Username:  username,
+	}
+	return database.DB.Create(group).Error
+}
+
 // RemoveAuthorizedGroup 移除授权群组
 func (s *GroupService) RemoveAuthorizedGroup(groupID int64) error {
 	return database.DB.Where("group_id = ?", groupID).
@@ -70,3 +80,13 @@ func (s *GroupService) UpdateGroupName(groupID int64, groupName string) error {
 		Update("group_name", groupName).Error
 }
 
+// UpdateGroupInfo 更新群组信息（名称和用户名）
+func (s *GroupService) UpdateGroupInfo(groupID int64, groupName, username string) error {
+	updates := map[string]interface{}{
+		"group_name": groupName,
+		"username":   username,
+	}
+	return database.DB.Model(&models.AuthorizedGroup{}).
+		Where("group_id = ?", groupID).
+		Updates(updates).Error
+}

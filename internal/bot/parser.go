@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"admin-bot/internal/service"
 	"admin-bot/internal/utils"
 	"fmt"
 	"regexp"
@@ -14,17 +15,21 @@ type CommandParams struct {
 	TargetUsers []int64 // 目标用户ID列表
 	Duration    int     // 时长（秒）
 	Reason      string  // 理由
+	IsBatch     bool    // 是否为批量操作
 }
 
 // ParseCommand 解析命令
-func ParseCommand(message *tgbotapi.Message, bot *tgbotapi.BotAPI) (*CommandParams, error) {
+func ParseCommand(message *tgbotapi.Message, bot *tgbotapi.BotAPI, userCacheService *service.UserCacheService) (*CommandParams, error) {
 	params := &CommandParams{
 		TargetUsers: make([]int64, 0),
+		IsBatch:     false,
 	}
 
 	// 1. 检查是否有引用回复
 	if message.ReplyToMessage != nil {
 		params.TargetUsers = append(params.TargetUsers, message.ReplyToMessage.From.ID)
+		// 引用回复不算批量操作
+		params.IsBatch = false
 	}
 
 	// 2. 解析命令参数
@@ -41,16 +46,25 @@ func ParseCommand(message *tgbotapi.Message, bot *tgbotapi.BotAPI) (*CommandPara
 	remainingArgs := args[1:]
 	var timeStr string
 	var reasonParts []string
+	userCount := 0
 
 	for _, arg := range remainingArgs {
 		if strings.HasPrefix(arg, "@") {
 			// 用户名
 			username := strings.TrimPrefix(arg, "@")
-			userID, err := GetUserIDByUsername(bot, message.Chat.ID, username)
+
+			// 优先从缓存中查询
+			userID, err := userCacheService.GetUserIDByUsername(username)
 			if err != nil {
-				return nil, fmt.Errorf("无法获取用户 @%s 的信息: %v", username, err)
+				// 缓存中没有，尝试通过API获取
+				userID, err = GetUserIDByUsername(bot, message.Chat.ID, username)
+				if err != nil {
+					return nil, fmt.Errorf("暂无 @%s 的用户信息，请尝试使用引用回复", username)
+				}
 			}
+
 			params.TargetUsers = append(params.TargetUsers, userID)
+			userCount++
 		} else if isDurationString(arg) {
 			// 时间
 			timeStr = arg
@@ -58,6 +72,11 @@ func ParseCommand(message *tgbotapi.Message, bot *tgbotapi.BotAPI) (*CommandPara
 			// 理由
 			reasonParts = append(reasonParts, arg)
 		}
+	}
+
+	// 判断是否为批量操作：只有通过@username指定多个用户才算批量
+	if userCount > 1 {
+		params.IsBatch = true
 	}
 
 	// 4. 解析时长

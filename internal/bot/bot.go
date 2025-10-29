@@ -41,6 +41,7 @@ func NewBot(cfg *config.Config) (*Bot, error) {
 	groupService := service.NewGroupService()
 	adminService := service.NewAdminService()
 	logService := service.NewLogService()
+	userCacheService := service.NewUserCacheService()
 	notificationService := service.NewNotificationService(bot,
 		cfg.Telegram.NotificationChannelID,
 		cfg.Telegram.AuthorID)
@@ -51,7 +52,7 @@ func NewBot(cfg *config.Config) (*Bot, error) {
 	// 创建处理器
 	handler := NewHandler(bot, cfg, permissionChecker,
 		banService, muteService, groupService, adminService,
-		logService, notificationService)
+		logService, notificationService, userCacheService)
 
 	// 创建调度器
 	taskScheduler := scheduler.NewScheduler(banService, muteService,
@@ -114,8 +115,16 @@ func (b *Bot) handleUpdate(update tgbotapi.Update) {
 			"聊天用户名": update.Message.Chat.UserName,
 		}).Debug("🔍 收到消息")
 
+		// 自动缓存发言用户信息
+		if update.Message.From != nil && !update.Message.From.IsBot {
+			b.handler.CacheUserInfo(update.Message.From)
+		}
+
 		// 检查新成员
-		if update.Message.NewChatMembers != nil && len(update.Message.NewChatMembers) > 0 {
+		if len(update.Message.NewChatMembers) > 0 {
+			// 检查是否有机器人自己被添加
+			b.handler.CheckBotAddedToGroup(update.Message, b.api.Self.ID)
+			// 检查新成员是否在黑名单
 			b.handler.CheckNewMember(update.Message)
 			return
 		}

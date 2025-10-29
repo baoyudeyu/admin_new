@@ -25,4 +25,3 @@ const (
 	ConfigKeyNotificationChannelID = "notification_channel_id"
 	ConfigKeyAuthorID              = "author_id"
 )
-

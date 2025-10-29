@@ -122,6 +122,7 @@ func (s *NotificationService) SendTextMessage(chatID int64, text string) error {
 func (s *NotificationService) sendMessage(chatID int64, text string) error {
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = "Markdown"
+	msg.DisableWebPagePreview = true // 禁用链接预览，避免占用空间
 
 	_, err := s.bot.Send(msg)
 	if err != nil {
@@ -141,6 +142,7 @@ func (s *NotificationService) sendMessage(chatID int64, text string) error {
 func (s *NotificationService) SendMessageWithButtons(chatID int64, text string, keyboard tgbotapi.InlineKeyboardMarkup) error {
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = "Markdown"
+	msg.DisableWebPagePreview = true // 禁用链接预览，避免占用空间
 	msg.ReplyMarkup = keyboard
 
 	_, err := s.bot.Send(msg)
@@ -155,6 +157,7 @@ func (s *NotificationService) SendMessageWithButtons(chatID int64, text string, 
 func (s *NotificationService) EditMessage(chatID int64, messageID int, text string, keyboard *tgbotapi.InlineKeyboardMarkup) error {
 	msg := tgbotapi.NewEditMessageText(chatID, messageID, text)
 	msg.ParseMode = "Markdown"
+	msg.DisableWebPagePreview = true // 禁用链接预览，避免占用空间
 	if keyboard != nil {
 		msg.ReplyMarkup = keyboard
 	}
