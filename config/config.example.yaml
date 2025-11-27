@@ -1,0 +1,29 @@
+# Telegram 机器人配置
+telegram:
+  bot_token: "YOUR_BOT_TOKEN_HERE"
+  author_ids: [YOUR_TELEGRAM_USER_ID_1, YOUR_TELEGRAM_USER_ID_2]  # 支持多个作者ID
+  notification_channel_id: 0  # 默认为0，需要通过 /config 命令配置
+
+# 数据库配置
+database:
+  host: "localhost"
+  port: 3306
+  username: "your_username"
+  password: "your_password"
+  database: "your_database"
+  charset: "utf8mb4"
+  max_idle_conns: 10
+  max_open_conns: 100
+  conn_max_lifetime: 3600 # 连接最大生命周期（秒）
+
+# 系统配置
+system:
+  rate_limit_per_group: 5 # 每个群组每秒最大操作数
+  admin_enabled: true # 启用群管理员权限
+  log_level: "info" # 日志级别：debug, info, warn, error
+  timezone: "Asia/Shanghai"
+
+# 调度器配置
+scheduler:
+  check_expire_interval: "*/1 * * * *" # 每分钟检查一次过期记录
+
